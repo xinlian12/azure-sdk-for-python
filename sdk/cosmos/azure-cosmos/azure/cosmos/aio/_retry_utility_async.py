@@ -66,9 +66,6 @@ async def ExecuteAsync(client, global_endpoint_manager, function, *args, **kwarg
     :returns: the result of running the passed in function as a (result, headers) tuple
     :rtype: tuple of (dict, dict)
     """
-    pk_range_wrapper = None
-    if args and (global_endpoint_manager.is_per_partition_automatic_failover_applicable(args[0]) or
-                 global_endpoint_manager.is_circuit_breaker_applicable(args[0])):
         pk_range_wrapper = await global_endpoint_manager.create_pk_range_wrapper(args[0])
     # instantiate all retry policies here to be applied for each request execution
     endpointDiscovery_retry_policy = _endpoint_discovery_retry_policy.EndpointDiscoveryRetryPolicy(
@@ -282,13 +279,14 @@ async def ExecuteFunctionAsync(function, *args, **kwargs):
 
 class _ConnectionRetryPolicy(AsyncRetryPolicy):
 
-    def __init__(self, **kwargs):
+    def __init__(self, availability_strategy=None, **kwargs):
         clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
         super(_ConnectionRetryPolicy, self).__init__(**clean_kwargs)
+        self.availability_strategy = availability_strategy
 
     async def send(self, request):
-        """Sends the PipelineRequest object to the next policy. Uses retry settings if necessary.
-        Also enforces an absolute client-side timeout that spans multiple retry attempts.
+        """Sends the PipelineRequest object to the next policy. Uses hedging if enabled,
+        otherwise falls back to retry settings.
 
         :param request: The PipelineRequest object
         :type request: ~azure.core.pipeline.PipelineRequest
@@ -302,10 +300,30 @@ class _ConnectionRetryPolicy(AsyncRetryPolicy):
         per_request_timeout = request.context.options.pop('connection_timeout', 0)
         request_params = request.context.options.pop('request_params', None)
         global_endpoint_manager = request.context.options.pop('global_endpoint_manager', None)
+
+        # Check for hedging first - this is threshold based, not retry based
+        if (self.availability_strategy and
+            self.availability_strategy.enabled and
+            not request.context.options.get('disable_hedging')):
+            try:
+                from .._asynchronous_request_hedging import execute_hedged_requests
+                return await execute_hedged_requests(
+                    self.next.send,
+                    [request],
+                    {'timeout': absolute_timeout} if absolute_timeout else {},
+                    self.availability_strategy,
+                    absolute_timeout
+                )
+            except ImportError:
+                # If hedging module not available, proceed with normal request
+                pass
+
+        # If hedging is not enabled or failed to import, proceed with normal request handling
         retry_error = None
         retry_active = True
         response = None
         retry_settings = self.configure_retries(request.context.options)
+
         while retry_active:
             start_time = time.time()
             try:

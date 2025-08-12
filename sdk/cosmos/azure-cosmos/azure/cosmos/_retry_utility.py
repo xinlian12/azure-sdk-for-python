@@ -54,6 +54,15 @@ from ._cosmos_http_logging_policy import _log_diagnostics_error
 # args [3] is the http request
 def Execute(client, global_endpoint_manager, function, *args, **kwargs): # pylint: disable=too-many-locals
     """Executes the function with passed parameters applying all retry policies
+    """
+    # Create context to track pending requests for hedging
+    context = {
+        "pending_requests": [],
+        "completed": False,
+        "result": None,
+        "headers": None
+    }
+    """Executes the function with passed parameters applying all retry policies
 
     :param object client:
         Document client instance
@@ -70,9 +79,15 @@ def Execute(client, global_endpoint_manager, function, *args, **kwargs): # pylin
                  global_endpoint_manager.is_circuit_breaker_applicable(args[0])):
         pk_range_wrapper = global_endpoint_manager.create_pk_range_wrapper(args[0])
     # instantiate all retry policies here to be applied for each request execution
+    # Initialize all retry policies
     endpointDiscovery_retry_policy = _endpoint_discovery_retry_policy.EndpointDiscoveryRetryPolicy(
         client.connection_policy, global_endpoint_manager, pk_range_wrapper, *args
     )
+    
+    # Initialize availability strategy if configured
+    availability_strategy = None
+    if args and len(args) > 0 and hasattr(args[0], "availability_strategy"):
+        availability_strategy = args[0].availability_strategy
     database_account_retry_policy = _database_account_retry_policy.DatabaseAccountRetryPolicy(
         client.connection_policy
     )
@@ -116,7 +131,27 @@ def Execute(client, global_endpoint_manager, function, *args, **kwargs): # pylin
         container_recreate_retry_policy = _container_recreate_retry_policy.ContainerRecreateRetryPolicy(
             client, client._container_properties_cache, None, *args)
 
+    def cancel_pending_requests():
+        """Cancel any pending requests when first successful response is received"""
+        if context["pending_requests"]:
+            for pending_request in context["pending_requests"]:
+                try:
+                    pending_request.cancel()
+                except:
+                    pass # Best effort cancellation
+            context["pending_requests"].clear()
+
     while True:
+        if availability_strategy and not context["completed"]:
+            # Handle hedging strategy
+            hedging_response = availability_strategy.execute_request(
+                lambda: function(global_endpoint_manager, *args, **kwargs),
+                context["pending_requests"]
+            )
+            if hedging_response:
+                context["completed"] = True
+                cancel_pending_requests()
+                return hedging_response
         client_timeout = kwargs.get('timeout')
         start_time = time.time()
         try:
@@ -163,6 +198,8 @@ def Execute(client, global_endpoint_manager, function, *args, **kwargs): # pylin
                                            logger_attributes, global_endpoint_manager, logger=logger)
                 raise e_offer
 
+            context["completed"] = True
+            cancel_pending_requests()
             return result
         except exceptions.CosmosHttpResponseError as e:
             if request:

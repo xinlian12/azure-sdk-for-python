@@ -24,6 +24,8 @@
 import copy
 import json
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, Future
 
 from urllib.parse import urlparse
 from azure.core.exceptions import DecodeError  # type: ignore
@@ -232,13 +234,125 @@ def SynchronizedRequest(
     :return: tuple of (result, headers)
     :rtype: tuple of (dict dict)
     """
-    request.data = _request_body_from_data(request_data)
-    if request.data and isinstance(request.data, str):
-        request.headers[http_constants.HttpHeaders.ContentLength] = len(request.data)
-    elif request.data is None:
-        request.headers[http_constants.HttpHeaders.ContentLength] = 0
+    def prepare_request(req, req_data):
+        """Helper to prepare request data and headers"""
+        req.data = _request_body_from_data(req_data)
+        if req.data and isinstance(req.data, str):
+            req.headers[http_constants.HttpHeaders.ContentLength] = len(req.data)
+        elif req.data is None:
+            req.headers[http_constants.HttpHeaders.ContentLength] = 0
+        return req
 
-    # Pass _Request function with its parameters to retry_utility's Execute method that wraps the call with retries
+    # Prepare the original request
+    request = prepare_request(request, request_data)
+
+    # Handle hedging if strategy is configured
+    if request_params.availability_strategy and not request_params.is_hedging_request:
+        # Get available locations from global endpoint manager
+        available_locations = global_endpoint_manager.get_ordered_read_locations()
+        
+        # Filter out excluded locations
+        if request_params.excluded_locations:
+            available_locations = [loc for loc in available_locations
+                                 if loc not in request_params.excluded_locations]
+        
+        # Set up thread pool for parallel execution
+        max_requests = min(len(available_locations),
+                         request_params.availability_strategy.max_hedged_requests)
+        executor = ThreadPoolExecutor(max_workers=max_requests)
+        futures = []
+        threshold = request_params.availability_strategy.threshold
+        threshold_steps = request_params.availability_strategy.threshold_steps
+
+        def execute_request(req, params):
+            """Helper to execute a single request"""
+            try:
+                return _retry_utility.Execute(
+                    client,
+                    global_endpoint_manager,
+                    _Request,
+                    params,
+                    connection_policy,
+                    pipeline_client,
+                    req,
+                    **kwargs
+                )
+            except exceptions.CosmosHttpResponseError as e:
+                # Check if error is non-transient
+                status_code = e.status_code
+                sub_status = e.sub_status
+                if (status_code in [400, 409, 405, 412, 413, 401] or
+                    (status_code == 404 and sub_status == 0)):
+                    # Non-transient error - propagate it
+                    raise
+                return None, None
+            except Exception as e:  # pylint: disable=broad-except
+                return None, None
+
+        # Create and execute initial request
+        futures.append(executor.submit(execute_request, request, request_params))
+
+        # Create hedged requests based on threshold
+        for _ in range(request_params.availability_strategy.max_hedged_requests - 1):
+            # Wait for threshold duration
+            time.sleep(threshold)
+            
+            # Check for completed requests
+            for future in futures:
+                if future.done():
+                    try:
+                        result = future.result()
+                        if result[0] is not None:  # Valid response received
+                            executor.shutdown(wait=False)
+                            return result
+                    except exceptions.CosmosHttpResponseError as e:
+                        # If non-transient error occurred, stop hedging
+                        status_code = e.status_code
+                        sub_status = e.sub_status
+                        if (status_code in [400, 409, 405, 412, 413, 401] or
+                            (status_code == 404 and sub_status == 0)):
+                            executor.shutdown(wait=False)
+                            raise
+                    except Exception:  # pylint: disable=broad-except
+                        pass  # Continue if request failed with transient error
+
+            # Create new hedged request targeting next available location
+            if len(futures) < len(available_locations):
+                hedged_params = copy.deepcopy(request_params)
+                hedged_params.is_hedging_request = True
+                # Route request to specific location
+                location = available_locations[len(futures)]
+                hedged_params.route_to_location(
+                    LocationCache.GetLocationalEndpoint(
+                        global_endpoint_manager.DefaultEndpoint,
+                        location
+                    )
+                )
+                hedged_request = copy.deepcopy(request)
+                future = executor.submit(execute_request, hedged_request, hedged_params)
+                futures.append(future)
+
+            # Track for cancellation
+            if hasattr(request_params, "pending_requests"):
+                request_params.pending_requests.append(future)
+
+            # Increase threshold for next iteration
+            threshold *= threshold_steps
+
+        # Wait for any remaining requests
+        for future in futures:
+            try:
+                result = future.result()
+                if result[0] is not None:  # Valid response received
+                    return result
+            except Exception:  # pylint: disable=broad-except
+                continue
+
+        # If all requests failed, raise the last exception
+        raise exceptions.CosmosClientError("All hedged requests failed")
+
+
+    # Regular execution path for non-hedged requests
     return _retry_utility.Execute(
         client,
         global_endpoint_manager,

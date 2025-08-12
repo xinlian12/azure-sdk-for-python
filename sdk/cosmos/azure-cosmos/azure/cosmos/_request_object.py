@@ -21,10 +21,14 @@
 
 """Represents a request object.
 """
-from typing import Optional, Mapping, Any, Dict, List
+from typing import Optional, Mapping, Any, Dict, List, TYPE_CHECKING
+
 from .documents import _OperationType
 from .http_constants import ResourceType
 from ._constants import _Constants as Constants
+
+if TYPE_CHECKING:
+    from ._availability_strategy import AvailabilityStrategy
 
 class RequestObject(object): # pylint: disable=too-many-instance-attributes
     def __init__(
@@ -39,6 +43,7 @@ class RequestObject(object): # pylint: disable=too-many-instance-attributes
         self.endpoint_override = endpoint_override
         self.should_clear_session_token_on_session_read_failure: bool = False  # pylint: disable=name-too-long
         self.headers = headers
+        self.availability_strategy: Optional["AvailabilityStrategy"] = None
         self.use_preferred_locations: Optional[bool] = None
         self.location_index_to_route: Optional[int] = None
         self.location_endpoint_to_route: Optional[str] = None
@@ -47,6 +52,7 @@ class RequestObject(object): # pylint: disable=too-many-instance-attributes
         self.excluded_locations_circuit_breaker: List[str] = []
         self.healthy_tentative_location: Optional[str] = None
         self.retry_write: bool = False
+        self.is_hedging_request: bool = False  # Flag to track if this is a hedged request
 
     def route_to_location_with_preferred_location_flag(  # pylint: disable=name-too-long
         self,
@@ -92,6 +98,19 @@ class RequestObject(object): # pylint: disable=too-many-instance-attributes
             elif client_retry_write and self.operation_type != _OperationType.Patch:
                 # If it is not a patch operation and the client config is set, set the retry write to True
                 self.retry_write = client_retry_write
+
+    def set_availability_strategy(self, request_options: Mapping[str, Any], client_strategy: "AvailabilityStrategy") -> None:
+        """Sets the availability strategy for this request.
+
+        :param request_options: Request specific options
+        :param client_strategy: Client level availability strategy
+        :return: None
+        """
+        # If request options contain a strategy, use it. Otherwise use client's strategy
+        if request_options and "availabilityStrategy" in request_options:
+            self.availability_strategy = request_options["availabilityStrategy"]
+        else:
+            self.availability_strategy = client_strategy
 
     def set_excluded_locations_from_circuit_breaker(self, excluded_locations: List[str]) -> None: # pylint: disable=name-too-long
         self.excluded_locations_circuit_breaker = excluded_locations

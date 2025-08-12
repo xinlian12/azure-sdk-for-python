@@ -1,25 +1,4 @@
-﻿# The MIT License (MIT)
-# Copyright (c) 2014 Microsoft Corporation
-
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-
-# The above copyright notice and this permission notice shall be included in all
-# copies or substantial portions of the Software.
-
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
-
-"""Classes and enums for documents in the Azure Cosmos database service.
+﻿"""Classes and enums for documents in the Azure Cosmos database service.
 """
 
 from typing import List, Optional, TYPE_CHECKING, Union, Dict, Any
@@ -27,6 +6,7 @@ from typing import List, Optional, TYPE_CHECKING, Union, Dict, Any
 from typing_extensions import Literal, TypedDict
 
 from ._retry_options import RetryOptions
+from ._availability_strategy import AvailabilityStrategy
 
 if TYPE_CHECKING:
     from ._retry_utility import ConnectionRetryPolicy
@@ -135,7 +115,7 @@ class ConsistencyLevel:
 
 class IndexingMode:
     """Specifies the supported indexing modes."""
-    Consistent: Literal["consistent"] = "consistent"
+    Consistent: Literal["consistent"] = "consistent" 
     """Index is updated synchronously with a create or update operation. With
     consistent indexing, query behavior is the same as the default
     consistency level for the collection.
@@ -337,6 +317,10 @@ class ConnectionPolicy:  # pylint: disable=too-many-instance-attributes
         Indicates whether service should be instructed to skip sending response payloads
     :ivar boolean RetryNonIdempotentWrites:
         Indicates whether the client should retry non-idempotent write requests for items
+    :ivar AvailabilityStrategy:
+        Gets or sets the availability strategy for improving request latency and availability.
+        The strategy can be overridden per request.
+    :vartype AvailabilityStrategy: Optional[~azure.cosmos.AvailabilityStrategy]
     """
 
     __defaultRequestTimeout: int = 5  # seconds
@@ -368,6 +352,7 @@ class ConnectionPolicy:  # pylint: disable=too-many-instance-attributes
         self.ConnectionRetryConfiguration: Optional["ConnectionRetryPolicy"] = None
         self.ResponsePayloadOnWriteDisabled: bool = False
         self.RetryNonIdempotentWrites: bool = False
+        self.AvailabilityStrategy: Optional[AvailabilityStrategy] = None
 
     def override_dba_timeouts(
             self,
