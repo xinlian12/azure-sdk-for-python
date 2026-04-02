@@ -7,14 +7,15 @@
 """
 DESCRIPTION:
     Given an AIProjectClient, this sample demonstrates how to use the synchronous
-    `openai.evals.*` methods to create, get and list evaluation and eval runs.
+    `openai.evals.*` methods to create, get and list evaluation and eval runs
+    with image data using a score model grader and a model target.
 
 USAGE:
-    python sample_evaluations_score_model_grader_with_image.py
+    python sample_evaluations_score_model_grader_with_image_model_target.py
 
     Before running the sample:
 
-    pip install "azure-ai-projects>=2.0.0" python-dotenv pillow
+    pip install "azure-ai-projects>=2.0.0" azure-identity python-dotenv Pillow
 
     Set these environment variables with your own values:
     1) AZURE_AI_PROJECT_ENDPOINT - Required. The Azure AI Project endpoint, as found in the overview page of your
@@ -32,7 +33,6 @@ from azure.ai.projects import AIProjectClient
 import time
 from pprint import pprint
 from openai.types.evals.create_eval_completions_run_data_source_param import (
-    CreateEvalCompletionsRunDataSourceParam,
     SourceFileContent,
     SourceFileContentContent,
     InputMessagesTemplate,
@@ -43,12 +43,13 @@ from openai.types.responses import EasyInputMessageParam
 from openai.types.eval_create_params import DataSourceConfigCustom
 from dotenv import load_dotenv
 
+
 load_dotenv()
 file_path = os.path.abspath(__file__)
 folder_path = os.path.dirname(file_path)
 
 endpoint = os.environ["AZURE_AI_PROJECT_ENDPOINT"]
-model_deployment_name = os.environ.get("AZURE_AI_MODEL_DEPLOYMENT_NAME", "")
+model_deployment_name = os.environ["AZURE_AI_MODEL_DEPLOYMENT_NAME"]
 
 
 def image_to_data_uri(image_path: str) -> str:
@@ -67,21 +68,19 @@ with (
 ):
 
     data_source_config = DataSourceConfigCustom(
-        {
-            "type": "custom",
-            "item_schema": {
-                "type": "object",
-                "properties": {
-                    "image_url": {"type": "string", "description": "The URL of the image to be evaluated."},
-                    "caption": {"type": "string", "description": "The caption describing the image."},
-                },
-                "required": [
-                    "image_url",
-                    "caption",
-                ],
+        type="custom",
+        item_schema={
+            "type": "object",
+            "properties": {
+                "image_url": {"type": "string", "description": "The URL of the image to be evaluated."},
+                "caption": {"type": "string", "description": "The caption describing the image."},
             },
-            "include_sample_schema": True,
-        }
+            "required": [
+                "image_url",
+                "caption",
+            ],
+        },
+        include_sample_schema=True,
     )
 
     testing_criteria = [
@@ -110,7 +109,7 @@ with (
 
     print("Creating evaluation")
     eval_object = client.evals.create(
-        name="OpenAI graders test",
+        name="OpenAI graders test image - model target",
         data_source_config=data_source_config,
         testing_criteria=testing_criteria,  # type: ignore
     )
@@ -157,20 +156,26 @@ with (
         ],
     )
 
+    data_source = {
+        "type": "azure_ai_target_completions",
+        "source": source_file_content,
+        "input_messages": input_messages,
+        "target": {
+            "type": "azure_ai_model",
+            "model": model_deployment_name,
+            "sampling_params": {  # Note: model sampling parameters are optional and can differ per model
+                "top_p": 1.0,
+                "max_completion_tokens": 5000,
+            },
+        },
+    }
+
     print("Creating Eval Run")
     eval_run_object = client.evals.runs.create(
         eval_id=eval_object.id,
         name="Eval",
         metadata={"team": "eval-exp", "scenario": "notifications-v1"},
-        data_source=CreateEvalCompletionsRunDataSourceParam(
-            type="completions",
-            source=source_file_content,
-            model=model_deployment_name,
-            input_messages=input_messages,
-            sampling_params={
-                "temperature": 0.8,
-            },
-        ),
+        data_source=data_source,  # type: ignore
     )
     print(f"Eval Run created (id: {eval_run_object.id}, name: {eval_run_object.name})")
     pprint(eval_run_object)
