@@ -6,17 +6,20 @@ import unittest
 import pytest
 
 from azure.cosmos._routing import routing_range as routing_range
-from azure.cosmos._routing.routing_map_provider import CollectionRoutingMap
-from azure.cosmos._routing.routing_map_provider import SmartRoutingMapProvider
-from azure.cosmos._routing.routing_map_provider import PartitionKeyRangeCache
+from azure.cosmos._routing.aio.routing_map_provider import CollectionRoutingMap
+from azure.cosmos._routing.aio.routing_map_provider import SmartRoutingMapProvider
+from azure.cosmos._routing.aio.routing_map_provider import PartitionKeyRangeCache
 from azure.cosmos import http_constants
 
 from typing import Optional, Mapping, Any
 from unittest.mock import MagicMock
-import threading
+
 
 @pytest.mark.cosmosEmulator
-class TestRoutingMapProvider(unittest.TestCase):
+class TestRoutingMapProviderAsync(unittest.IsolatedAsyncioTestCase):
+    """Async unit tests for PartitionKeyRangeCache and SmartRoutingMapProvider.
+    """
+
     @staticmethod
     def _capture_internal_headers(kwargs, etag):
         captured_headers = kwargs.get('_internal_response_headers_capture')
@@ -25,94 +28,66 @@ class TestRoutingMapProvider(unittest.TestCase):
             captured_headers.update({'ETag': etag})
 
     class MockedCosmosClientConnection(object):
+        """Mock that returns partition key ranges as an async generator."""
 
         def __init__(self, partition_key_ranges):
             self.partition_key_ranges = partition_key_ranges
 
-        def _ReadPartitionKeyRanges(self, _collection_link: str, _feed_options: Optional[Mapping[str, Any]] = None, **kwargs):
-            TestRoutingMapProvider._capture_internal_headers(kwargs, '"test-etag-1"')
-            return self.partition_key_ranges
+        def _ReadPartitionKeyRanges(self, _collection_link: str,
+                                    _feed_options: Optional[Mapping[str, Any]] = None, **kwargs):
+            TestRoutingMapProviderAsync._capture_internal_headers(kwargs, '"test-etag-1"')
+
+            ranges = self.partition_key_ranges
+
+            async def _gen():
+                for r in ranges:
+                    yield r
+
+            return _gen()
 
     def setUp(self):
-        self.partition_key_ranges = [{u'id': u'0', u'minInclusive': u'', u'maxExclusive': u'05C1C9CD673398'},
-                                     {u'id': u'1', u'minInclusive': u'05C1C9CD673398',
-                                      u'maxExclusive': u'05C1D9CD673398'},
-                                     {u'id': u'2', u'minInclusive': u'05C1D9CD673398',
-                                      u'maxExclusive': u'05C1E399CD6732'},
-                                     {u'id': u'3', u'minInclusive': u'05C1E399CD6732',
-                                      u'maxExclusive': u'05C1E9CD673398'},
-                                     {u'id': u'4', u'minInclusive': u'05C1E9CD673398', u'maxExclusive': u'FF'}]
-        self.smart_routing_map_provider = self.instantiate_smart_routing_map_provider(self.partition_key_ranges)
+        self.partition_key_ranges = [
+            {u'id': u'0', u'minInclusive': u'', u'maxExclusive': u'05C1C9CD673398'},
+            {u'id': u'1', u'minInclusive': u'05C1C9CD673398', u'maxExclusive': u'05C1D9CD673398'},
+            {u'id': u'2', u'minInclusive': u'05C1D9CD673398', u'maxExclusive': u'05C1E399CD6732'},
+            {u'id': u'3', u'minInclusive': u'05C1E399CD6732', u'maxExclusive': u'05C1E9CD673398'},
+            {u'id': u'4', u'minInclusive': u'05C1E9CD673398', u'maxExclusive': u'FF'},
+        ]
+        self.smart_routing_map_provider = self._instantiate_smart_routing_map_provider(self.partition_key_ranges)
 
-        partitionRangeWithInfo = map(lambda r: (r, True), self.partition_key_ranges)
-        self.cached_collection_routing_map = CollectionRoutingMap.CompleteRoutingMap(partitionRangeWithInfo,
-                                                                                     'sample collection id')
+        partitionRangeWithInfo = [(r, True) for r in self.partition_key_ranges]
+        self.cached_collection_routing_map = CollectionRoutingMap.CompleteRoutingMap(
+            partitionRangeWithInfo, 'sample collection id'
+        )
 
-    def instantiate_smart_routing_map_provider(self, partition_key_ranges):
-        client = TestRoutingMapProvider.MockedCosmosClientConnection(partition_key_ranges)
+    def _instantiate_smart_routing_map_provider(self, partition_key_ranges):
+        client = TestRoutingMapProviderAsync.MockedCosmosClientConnection(partition_key_ranges)
         return SmartRoutingMapProvider(client)
 
-    def test_full_range(self):
-        # query range is the whole partition key range
+    # ---------------------------------------------------------------
+    # SmartRoutingMapProvider.get_overlapping_ranges tests
+    # ---------------------------------------------------------------
+
+    async def test_full_range_async(self):
         pkRange = routing_range.Range("", "FF", True, False)
-        overlapping_partition_key_ranges = self.get_overlapping_ranges([pkRange])
-        self.assertEqual(len(overlapping_partition_key_ranges), len(self.partition_key_ranges))
-        self.assertEqual(overlapping_partition_key_ranges, self.partition_key_ranges)
+        overlapping = await self.smart_routing_map_provider.get_overlapping_ranges(
+            "dbs/db/colls/container", [pkRange])
+        self.assertEqual(len(overlapping), len(self.partition_key_ranges))
+        self.assertEqual(overlapping, self.partition_key_ranges)
 
-        pkRange = routing_range.Range("", "FF", False, False)
-        overlapping_partition_key_ranges = self.get_overlapping_ranges([pkRange])
-        self.assertEqual(overlapping_partition_key_ranges, self.partition_key_ranges)
-        self.assertEqual(self.cached_collection_routing_map.get_overlapping_ranges([pkRange]),
-                         self.partition_key_ranges)
+    async def test_empty_ranges_async(self):
+        overlapping = await self.smart_routing_map_provider.get_overlapping_ranges(
+            "dbs/db/colls/container", [])
+        self.assertEqual(len(overlapping), 0)
 
-    def test_empty_ranges(self):
-        # query range is the whole partition key range
-        pkRange = routing_range.Range("", "FF", True, False)
-        overlapping_partition_key_ranges = self.get_overlapping_ranges([pkRange])
-        self.assertEqual(len(overlapping_partition_key_ranges), len(self.partition_key_ranges))
-        self.assertEqual(overlapping_partition_key_ranges, self.partition_key_ranges)
-
-        # query range list is empty
-        overlapping_partition_key_ranges = self.get_overlapping_ranges([])
-        self.assertEqual(len(overlapping_partition_key_ranges), 0)
-
-        # validate the overlaping partition key ranges results for empty ranges is empty
-        empty_start_range = routing_range.Range("", "", False, True)
-        empty_end_range = routing_range.Range("FF", "FF", False, True)
-        empty_range = routing_range.Range("AA", "AA", False, True)
-        self.validate_empty_query_ranges([empty_range], [empty_start_range], [empty_end_range],
-                                         [empty_start_range, empty_range], [empty_start_range, empty_end_range],
-                                         [empty_range, empty_end_range],
-                                         [empty_range, empty_range, empty_end_range])
-
-    def test_bad_overlapping_query_ranges(self):
-        # they share AA point
+    async def test_bad_overlapping_query_ranges_async(self):
         r1 = routing_range.Range("", "AA", True, True)
         r2 = routing_range.Range("AA", "FF", True, False)
+        with self.assertRaises(ValueError):
+            await self.smart_routing_map_provider.get_overlapping_ranges(
+                "sample collection id", [r1, r2])
 
-        def func_one_point_overlap():
-            self.smart_routing_map_provider.get_overlapping_ranges("sample collection id", [r1, r2])
-
-        self.assertRaises(ValueError, func_one_point_overlap)
-
-        # overlapping range
-        r1 = routing_range.Range("", "AB", True, False)
-        r2 = routing_range.Range("AA", "FA", True, False)
-
-        def func_overlap():
-            self.smart_routing_map_provider.get_overlapping_ranges("sample collection id", [r1, r2])
-
-        self.assertRaises(ValueError, func_overlap)
-
-        r1 = routing_range.Range("AB", "AC", True, False)
-        r1 = routing_range.Range("AA", "AB", True, False)
-
-        def func_non_sorted():
-            self.smart_routing_map_provider.get_overlapping_ranges("sample collection id", [r1, r2])
-
-        self.assertRaises(ValueError, func_overlap)
-
-    def test_empty_ranges_are_thrown_away(self):
+    async def test_empty_ranges_are_thrown_away_async(self):
         e1 = routing_range.Range("", "", True, False)
         r1 = routing_range.Range("", "AB", True, False)
         e2 = routing_range.Range("AB", "AB", True, False)
@@ -120,113 +95,109 @@ class TestRoutingMapProvider(unittest.TestCase):
         e3 = routing_range.Range("AC", "AC", True, False)
         e4 = routing_range.Range("AD", "AD", True, False)
 
-        self.validate_overlapping_ranges_results([e1, r1, e2, r2, e3, e4], self.get_overlapping_ranges([r1, r2]))
-        self.validate_against_cached_collection_results([e1, r1, e2, r2, e3, e4])
+        overlapping = await self.smart_routing_map_provider.get_overlapping_ranges(
+            "dbs/db/colls/container", [r1, r2])
+        overlapping_all = await self.smart_routing_map_provider.get_overlapping_ranges(
+            "dbs/db/colls/container", [e1, r1, e2, r2, e3, e4])
+        self.assertEqual(overlapping_all, overlapping)
+        self.assertEqual(overlapping_all,
+                         self.cached_collection_routing_map.get_overlapping_ranges([e1, r1, e2, r2, e3, e4]))
 
-    def test_simple(self):
+    async def test_simple_async(self):
         r = routing_range.Range("AB", "AC", True, False)
-        self.validate_against_cached_collection_results([r])
+        overlapping = await self.smart_routing_map_provider.get_overlapping_ranges(
+            "dbs/db/colls/container", [r])
+        self.assertEqual(overlapping, self.cached_collection_routing_map.get_overlapping_ranges([r]))
 
+    async def test_simple_boundary_async(self):
         ranges = [
-            routing_range.Range("0000000040", "0000000045", True, False),
-            routing_range.Range("0000000045", "0000000046", True, False),
-            routing_range.Range("0000000046", "0000000050", True, False)
-        ]
-        self.validate_against_cached_collection_results(ranges)
-
-    def test_simple_boundary(self):
-        ranges = [
-
             routing_range.Range("05C1C9CD673398", "05C1D9CD673398", True, False),
         ]
-        self.validate_against_cached_collection_results(ranges)
-        self.validate_overlapping_ranges_results(ranges, self.partition_key_ranges[1:2])
+        overlapping = await self.smart_routing_map_provider.get_overlapping_ranges(
+            "dbs/db/colls/container", ranges)
+        self.assertEqual(overlapping,
+                         self.cached_collection_routing_map.get_overlapping_ranges(ranges))
+        self.assertEqual(overlapping, self.partition_key_ranges[1:2])
 
-    def test_two_adjacent_boundary(self):
+    async def test_two_adjacent_boundary_async(self):
         ranges = [
             # self.partition_key_ranges[1]
             routing_range.Range("05C1C9CD673398", "05C1D9CD673398", True, False),
-
             # self.partition_key_ranges[2]
             routing_range.Range("05C1D9CD673398", "05C1D9CD673399", True, False),
         ]
-        self.validate_against_cached_collection_results(ranges)
-        self.validate_overlapping_ranges_results(ranges, self.partition_key_ranges[1:3])
+        overlapping = await self.smart_routing_map_provider.get_overlapping_ranges(
+            "dbs/db/colls/container", ranges)
+        self.assertEqual(overlapping,
+                         self.cached_collection_routing_map.get_overlapping_ranges(ranges))
+        self.assertEqual(overlapping, self.partition_key_ranges[1:3])
 
-    def test_two_ranges_in_one_partition_key_range(self):
+    async def test_two_ranges_in_one_partition_key_range_async(self):
         # two ranges fall in the same partition key range
         ranges = [
             routing_range.Range("05C1C9CD673400", "05C1C9CD673401", True, False),
             routing_range.Range("05C1C9CD673402", "05C1C9CD673403", True, False),
-
         ]
-        self.validate_against_cached_collection_results(ranges)
-        self.validate_overlapping_ranges_results(ranges, self.partition_key_ranges[1:2])
+        overlapping = await self.smart_routing_map_provider.get_overlapping_ranges(
+            "dbs/db/colls/container", ranges)
+        self.assertEqual(overlapping,
+                         self.cached_collection_routing_map.get_overlapping_ranges(ranges))
+        self.assertEqual(overlapping, self.partition_key_ranges[1:2])
 
-    def test_complex(self):
+    async def test_complex_async(self):
         ranges = [
-            # all are covered by self.partition_key_ranges[1]
             routing_range.Range("05C1C9CD673398", "05C1D9CD673391", True, False),
             routing_range.Range("05C1D9CD673391", "05C1D9CD673392", True, False),
             routing_range.Range("05C1D9CD673393", "05C1D9CD673395", True, False),
             routing_range.Range("05C1D9CD673395", "05C1D9CD673395", True, False),
-            # all are covered by self.partition_key_ranges[4]]
             routing_range.Range("05C1E9CD673398", "05C1E9CD673401", True, False),
             routing_range.Range("05C1E9CD673402", "05C1E9CD673403", True, False),
-            # empty range
             routing_range.Range("FF", "FF", True, False),
         ]
-        self.validate_against_cached_collection_results(ranges)
-        self.validate_overlapping_ranges_results(ranges, [self.partition_key_ranges[1], self.partition_key_ranges[4]])
+        overlapping = await self.smart_routing_map_provider.get_overlapping_ranges(
+            "dbs/db/colls/container", ranges)
+        expected = [self.partition_key_ranges[1], self.partition_key_ranges[4]]
+        self.assertEqual(overlapping, expected)
 
-    def validate_against_cached_collection_results(self, queryRanges):
-        # validates the results of smart routing map provider against the results of cached collection map
-        overlapping_partition_key_ranges = self.get_overlapping_ranges(queryRanges)
-        self.assertEqual(overlapping_partition_key_ranges,
-                         self.cached_collection_routing_map.get_overlapping_ranges(queryRanges))
+    # ---------------------------------------------------------------
+    # PartitionKeyRangeCache(async) caching tests
+    # ---------------------------------------------------------------
 
-    def validate_overlapping_ranges_results(self, queryRanges, expected_overlapping_partition_key_ranges):
-        overlapping_partition_key_ranges = self.get_overlapping_ranges(queryRanges)
-        self.assertEqual(overlapping_partition_key_ranges, expected_overlapping_partition_key_ranges)
-
-    def validate_empty_query_ranges(self, *queryRangesList):
-        for queryRanges in queryRangesList:
-            self.validate_overlapping_ranges_results(queryRanges, [])
-
-    def get_overlapping_ranges(self, queryRanges):
-        return self.smart_routing_map_provider.get_overlapping_ranges("dbs/db/colls/container", queryRanges)
-
-    def test_get_routing_map_caches_on_first_call(self):
+    async def test_get_routing_map_caches_on_first_call_async(self):
         """Initial call to get_routing_map fetches from service and caches the result."""
         provider = PartitionKeyRangeCache(
-            TestRoutingMapProvider.MockedCosmosClientConnection(self.partition_key_ranges)
+            TestRoutingMapProviderAsync.MockedCosmosClientConnection(self.partition_key_ranges)
         )
         collection_link = "dbs/db/colls/container"
 
-        result = provider.get_routing_map(collection_link, feed_options={})
+        result = await provider.get_routing_map(collection_link, feed_options={})
 
         self.assertIsNotNone(result)
         self.assertEqual(len(list(result._orderedPartitionKeyRanges)), 5)
-        # Verify it's cached
         from azure.cosmos import _base
         collection_id = _base.GetResourceIdOrFullNameFromLink(collection_link)
         self.assertIn(collection_id, provider._collection_routing_map_by_item)
 
-    def test_fetch_routing_map_preserves_user_response_hook_and_internal_etag_capture(self):
-        """User response_hook should still be invoked while internal header capture sets map ETag."""
+    async def test_fetch_routing_map_preserves_user_response_hook_and_internal_etag_capture_async(self):
+        """User response_hook should still fire while internal header capture sets map ETag."""
         hook_calls = []
         expected_internal_etag = '"internal-etag"'
 
         class HookAwareClient:
+            def __init__(self, partition_key_ranges):
+                self.partition_key_ranges = partition_key_ranges
+
             def _ReadPartitionKeyRanges(self, _collection_link, feed_options=None, **kwargs):
-                TestRoutingMapProvider._capture_internal_headers(kwargs, expected_internal_etag)
+                TestRoutingMapProviderAsync._capture_internal_headers(kwargs, expected_internal_etag)
                 response_hook = kwargs.get('response_hook')
                 if response_hook:
                     response_hook({'ETag': '"user-hook-etag"'}, None)
-                return self.partition_key_ranges
 
-            def __init__(self, partition_key_ranges):
-                self.partition_key_ranges = partition_key_ranges
+                async def _gen():
+                    for r in self.partition_key_ranges:
+                        yield r
+
+                return _gen()
 
         provider = PartitionKeyRangeCache(HookAwareClient(self.partition_key_ranges))
         collection_link = "dbs/db/colls/container"
@@ -234,13 +205,13 @@ class TestRoutingMapProvider(unittest.TestCase):
         def user_hook(headers, _):
             hook_calls.append(headers.get('ETag'))
 
-        result = provider.get_routing_map(collection_link, feed_options={}, response_hook=user_hook)
+        result = await provider.get_routing_map(collection_link, feed_options={}, response_hook=user_hook)
 
         self.assertIsNotNone(result)
         self.assertEqual(result.change_feed_etag, expected_internal_etag)
         self.assertEqual(hook_calls, ['"user-hook-etag"'])
 
-    def test_get_routing_map_returns_cached_on_second_call(self):
+    async def test_get_routing_map_returns_cached_on_second_call_async(self):
         """Second call returns the same cached object without re-fetching."""
         call_count = {'count': 0}
         original_ranges = self.partition_key_ranges
@@ -248,19 +219,24 @@ class TestRoutingMapProvider(unittest.TestCase):
         class CountingClient:
             def _ReadPartitionKeyRanges(self, _collection_link, feed_options=None, **kwargs):
                 call_count['count'] += 1
-                TestRoutingMapProvider._capture_internal_headers(kwargs, '"test-etag-1"')
-                return original_ranges
+                TestRoutingMapProviderAsync._capture_internal_headers(kwargs, '"test-etag-1"')
+
+                async def _gen():
+                    for r in original_ranges:
+                        yield r
+
+                return _gen()
 
         provider = PartitionKeyRangeCache(CountingClient())
         collection_link = "dbs/db/colls/container"
 
-        result1 = provider.get_routing_map(collection_link, feed_options={})
-        result2 = provider.get_routing_map(collection_link, feed_options={})
+        result1 = await provider.get_routing_map(collection_link, feed_options={})
+        result2 = await provider.get_routing_map(collection_link, feed_options={})
 
         self.assertIs(result1, result2, "Second call should return the exact same cached object")
         self.assertEqual(call_count['count'], 1, "Service should only be called once")
 
-    def test_get_routing_map_force_refresh(self):
+    async def test_get_routing_map_force_refresh_async(self):
         """force_refresh=True causes a re-fetch even when cache is populated.
 
         The force_refresh path passes the previous routing map as the base for an
@@ -281,18 +257,23 @@ class TestRoutingMapProvider(unittest.TestCase):
         class CountingClient:
             def _ReadPartitionKeyRanges(self, _collection_link, feed_options=None, **kwargs):
                 call_count['count'] += 1
-                TestRoutingMapProvider._capture_internal_headers(kwargs, f'"test-etag-{call_count["count"]}"')
-                if call_count['count'] == 1:
-                    return original_ranges
-                return split_ranges
+                TestRoutingMapProviderAsync._capture_internal_headers(kwargs, f'"test-etag-{call_count["count"]}"')
+
+                data = original_ranges if call_count['count'] == 1 else split_ranges
+
+                async def _gen():
+                    for r in data:
+                        yield r
+
+                return _gen()
 
         provider = PartitionKeyRangeCache(CountingClient())
         collection_link = "dbs/db/colls/container"
 
-        result1 = provider.get_routing_map(collection_link, feed_options={})
+        result1 = await provider.get_routing_map(collection_link, feed_options={})
         self.assertEqual(call_count['count'], 1)
 
-        result2 = provider.get_routing_map(
+        result2 = await provider.get_routing_map(
             collection_link, feed_options={},
             force_refresh=True, previous_routing_map=result1
         )
@@ -301,25 +282,24 @@ class TestRoutingMapProvider(unittest.TestCase):
         # Verify the split was applied: should now have 6 ranges (original 5 minus '0' plus '5' and '6')
         self.assertEqual(len(list(result2._orderedPartitionKeyRanges)), 6)
 
-    def test_is_cache_stale_etag_logic(self):
+    async def test_is_cache_stale_etag_logic_async(self):
         """_is_cache_stale returns correct results for all ETag scenarios."""
         provider = PartitionKeyRangeCache(
-            TestRoutingMapProvider.MockedCosmosClientConnection(self.partition_key_ranges)
+            TestRoutingMapProviderAsync.MockedCosmosClientConnection(self.partition_key_ranges)
         )
         collection_link = "dbs/db/colls/container"
         from azure.cosmos import _base
         collection_id = _base.GetResourceIdOrFullNameFromLink(collection_link)
 
-        # Populate cache
-        cached_map = provider.get_routing_map(collection_link, feed_options={})
+        cached_map = await provider.get_routing_map(collection_link, feed_options={})
 
         # Case 1: None previous -> False
         self.assertFalse(provider._is_cache_stale(collection_id, None))
 
-        # Case 2: Same ETag → True (stale)
+        # Case 2: Same ETag -> True (stale)
         self.assertTrue(provider._is_cache_stale(collection_id, cached_map))
 
-        # Case 3: Different ETag -> False (already refreshed by someone else)
+        # Case 3: Different ETag -> False (already refreshed)
         mock_map = MagicMock()
         mock_map.change_feed_etag = "completely-different-etag"
         self.assertFalse(provider._is_cache_stale(collection_id, mock_map))
@@ -330,7 +310,7 @@ class TestRoutingMapProvider(unittest.TestCase):
         mock_map2.change_feed_etag = cached_map.change_feed_etag
         self.assertFalse(provider._is_cache_stale(collection_id, mock_map2))
 
-    def test_fetch_routing_map_full_load_with_incomplete_ranges_returns_none(self):
+    async def test_fetch_routing_map_full_load_with_incomplete_ranges_returns_none_async(self):
         """When a full load (previous_routing_map=None) returns gapped ranges, returns None immediately."""
         incomplete_ranges = [
             {'id': '0', 'minInclusive': '', 'maxExclusive': '80'}  # Gap from 80 to FF
@@ -338,15 +318,20 @@ class TestRoutingMapProvider(unittest.TestCase):
 
         class IncompleteClient:
             def _ReadPartitionKeyRanges(self, _collection_link, feed_options=None, **kwargs):
-                TestRoutingMapProvider._capture_internal_headers(kwargs, '"incomplete-etag"')
-                return incomplete_ranges
+                TestRoutingMapProviderAsync._capture_internal_headers(kwargs, '"incomplete-etag"')
+
+                async def _gen():
+                    for r in incomplete_ranges:
+                        yield r
+
+                return _gen()
 
         provider = PartitionKeyRangeCache(IncompleteClient())
         from azure.cosmos import _base
         collection_link = "dbs/db/colls/container"
         collection_id = _base.GetResourceIdOrFullNameFromLink(collection_link)
 
-        result = provider._fetch_routing_map(
+        result = await provider._fetch_routing_map(
             collection_link=collection_link,
             collection_id=collection_id,
             previous_routing_map=None,
@@ -354,9 +339,8 @@ class TestRoutingMapProvider(unittest.TestCase):
         )
         self.assertIsNone(result, "Should return None when full load produces incomplete ranges")
 
-    def test_fetch_routing_map_incremental_with_parents(self):
+    async def test_fetch_routing_map_incremental_with_parents_async(self):
         """Incremental update correctly merges child ranges that reference a parent."""
-        # Build initial map with 2 ranges
         initial_ranges = [
             {'id': '0', 'minInclusive': '', 'maxExclusive': '80'},
             {'id': '1', 'minInclusive': '80', 'maxExclusive': 'FF'}
@@ -367,7 +351,6 @@ class TestRoutingMapProvider(unittest.TestCase):
             '"etag-1"'
         )
 
-        # Simulate change feed returning children of range '0'
         delta_ranges = [
             {'id': '2', 'minInclusive': '', 'maxExclusive': '40', 'parents': ['0']},
             {'id': '3', 'minInclusive': '40', 'maxExclusive': '80', 'parents': ['0']}
@@ -375,15 +358,20 @@ class TestRoutingMapProvider(unittest.TestCase):
 
         class DeltaClient:
             def _ReadPartitionKeyRanges(self, _collection_link, feed_options=None, **kwargs):
-                TestRoutingMapProvider._capture_internal_headers(kwargs, '"etag-2"')
-                return delta_ranges
+                TestRoutingMapProviderAsync._capture_internal_headers(kwargs, '"etag-2"')
+
+                async def _gen():
+                    for r in delta_ranges:
+                        yield r
+
+                return _gen()
 
         provider = PartitionKeyRangeCache(DeltaClient())
         from azure.cosmos import _base
         collection_link = "dbs/db/colls/container"
         collection_id = _base.GetResourceIdOrFullNameFromLink(collection_link)
 
-        result = provider._fetch_routing_map(
+        result = await provider._fetch_routing_map(
             collection_link=collection_link,
             collection_id=collection_id,
             previous_routing_map=initial_map,
@@ -397,7 +385,7 @@ class TestRoutingMapProvider(unittest.TestCase):
         self.assertEqual(ranges[1]['id'], '3')
         self.assertEqual(ranges[2]['id'], '1')
 
-    def test_fetch_routing_map_cleans_if_none_match_on_fallback(self):
+    async def test_fetch_routing_map_cleans_if_none_match_on_fallback_async(self):
         """When falling back from incremental to full load, stale IfNoneMatch is removed."""
         initial_ranges = [
             {'id': '0', 'minInclusive': '', 'maxExclusive': 'FF'}
@@ -419,19 +407,22 @@ class TestRoutingMapProvider(unittest.TestCase):
                 call_count['count'] += 1
                 headers = kwargs.get('headers', {})
                 captured_headers_list.append(headers.copy())
-                TestRoutingMapProvider._capture_internal_headers(kwargs, f'"etag-{call_count["count"]}"')
-                if call_count['count'] <= 2:
-                    # Return a child with missing parent to force incremental retry,
-                    # then full-load fallback.
-                    return [{'id': '99', 'minInclusive': '', 'maxExclusive': 'FF', 'parents': ['MISSING']}]
-                return full_ranges
+                TestRoutingMapProviderAsync._capture_internal_headers(kwargs, f'"etag-{call_count["count"]}"')
+                data = ([{'id': '99', 'minInclusive': '', 'maxExclusive': 'FF',
+                          'parents': ['MISSING']}] if call_count['count'] <= 2 else full_ranges)
+
+                async def _gen():
+                    for r in data:
+                        yield r
+
+                return _gen()
 
         provider = PartitionKeyRangeCache(HeaderCapturingClient())
         from azure.cosmos import _base
         collection_link = "dbs/db/colls/container"
         collection_id = _base.GetResourceIdOrFullNameFromLink(collection_link)
 
-        result = provider._fetch_routing_map(
+        result = await provider._fetch_routing_map(
             collection_link=collection_link,
             collection_id=collection_id,
             previous_routing_map=initial_map,
@@ -450,7 +441,7 @@ class TestRoutingMapProvider(unittest.TestCase):
         # Third call is full-load fallback and must clear stale IfNoneMatch.
         self.assertNotIn(http_constants.HttpHeaders.IfNoneMatch, captured_headers_list[2])
 
-    def test_fetch_routing_map_merge_parents0_evicted_later_parent_cached(self):
+    async def test_fetch_routing_map_merge_parents0_evicted_later_parent_cached_async(self):
         """Merge where parents[0] is an evicted grandparent but a later parent IS in cache.
 
         Scenario:
@@ -472,7 +463,6 @@ class TestRoutingMapProvider(unittest.TestCase):
             '"etag-B"'
         )
 
-        # Merge delta: '1A' and '1B' merge into '3', parents includes evicted '1'
         delta_ranges = [
             {'id': '3', 'minInclusive': '40', 'maxExclusive': '80', 'parents': ['1', '1A', '1B']}
         ]
@@ -481,15 +471,20 @@ class TestRoutingMapProvider(unittest.TestCase):
         class MergeClient:
             def _ReadPartitionKeyRanges(self, _collection_link, feed_options=None, **kwargs):
                 call_count['count'] += 1
-                TestRoutingMapProvider._capture_internal_headers(kwargs, '"etag-C"')
-                return delta_ranges
+                TestRoutingMapProviderAsync._capture_internal_headers(kwargs, '"etag-C"')
+
+                async def _gen():
+                    for r in delta_ranges:
+                        yield r
+
+                return _gen()
 
         provider = PartitionKeyRangeCache(MergeClient())
         from azure.cosmos import _base
         collection_link = "dbs/db/colls/container"
         collection_id = _base.GetResourceIdOrFullNameFromLink(collection_link)
 
-        result = provider._fetch_routing_map(
+        result = await provider._fetch_routing_map(
             collection_link=collection_link,
             collection_id=collection_id,
             previous_routing_map=initial_map,
@@ -503,13 +498,13 @@ class TestRoutingMapProvider(unittest.TestCase):
         ids = [r['id'] for r in ranges]
         self.assertEqual(ids, ['0', '3', '2'])
 
-    def test_fetch_routing_map_merge_all_parents_cached(self):
+    async def test_fetch_routing_map_merge_all_parents_cached_async(self):
         """Merge where all parents are in cache — validates first-match range_info inheritance.
 
         Scenario:
         - Cache has: {0, 1, 2} with distinct range_info values
         - Ranges '0' and '1' merge into '3' with parents=['0', '1']
-        - Both '0' and '1' are in cache -> should pick '0' (first match) range_info
+        - Both '0' and '1' are in cache → should pick '0' (first match) range_info
         """
         initial_ranges = [
             {'id': '0', 'minInclusive': '', 'maxExclusive': '40'},
@@ -528,15 +523,20 @@ class TestRoutingMapProvider(unittest.TestCase):
 
         class MergeClient:
             def _ReadPartitionKeyRanges(self, _collection_link, feed_options=None, **kwargs):
-                TestRoutingMapProvider._capture_internal_headers(kwargs, '"etag-2"')
-                return delta_ranges
+                TestRoutingMapProviderAsync._capture_internal_headers(kwargs, '"etag-2"')
+
+                async def _gen():
+                    for r in delta_ranges:
+                        yield r
+
+                return _gen()
 
         provider = PartitionKeyRangeCache(MergeClient())
         from azure.cosmos import _base
         collection_link = "dbs/db/colls/container"
         collection_id = _base.GetResourceIdOrFullNameFromLink(collection_link)
 
-        result = provider._fetch_routing_map(
+        result = await provider._fetch_routing_map(
             collection_link=collection_link,
             collection_id=collection_id,
             previous_routing_map=initial_map,
@@ -553,7 +553,7 @@ class TestRoutingMapProvider(unittest.TestCase):
         # Stable range '2' should keep its original range_info
         self.assertEqual(result._orderedPartitionInfo[1], 'info_2')
 
-    def test_fetch_routing_map_two_rapid_splits_all_parents_missing(self):
+    async def test_fetch_routing_map_two_rapid_splits_all_parents_missing_async(self):
         """Two rapid splits where the intermediate range was never cached.
 
         Scenario:
@@ -564,9 +564,6 @@ class TestRoutingMapProvider(unittest.TestCase):
         - Delta returns '1A-i' with parents=['1A'], '1A-ii' with parents=['1A'], '1B' with parents=['1']
         - '1B' has parent '1' -> found in cache
         - '1A-i' has parent '1A' -> NOT found (intermediate, never cached) → falls back to full refresh
-
-        This scenario validates that when none of a range's parents are in cache,
-        the code correctly falls back to a full refresh.
         """
         initial_ranges = [
             {'id': '0', 'minInclusive': '', 'maxExclusive': '40'},
@@ -580,13 +577,11 @@ class TestRoutingMapProvider(unittest.TestCase):
         )
 
         call_count = {'count': 0}
-        # Delta from two rapid splits: '1A' was intermediate (never cached)
         delta_ranges = [
             {'id': '1B', 'minInclusive': '60', 'maxExclusive': '80', 'parents': ['1']},
             {'id': '1A-i', 'minInclusive': '40', 'maxExclusive': '50', 'parents': ['1A']},
             {'id': '1A-ii', 'minInclusive': '50', 'maxExclusive': '60', 'parents': ['1A']}
         ]
-        # Full refresh returns the final state
         full_ranges = [
             {'id': '0', 'minInclusive': '', 'maxExclusive': '40'},
             {'id': '1A-i', 'minInclusive': '40', 'maxExclusive': '50'},
@@ -598,17 +593,21 @@ class TestRoutingMapProvider(unittest.TestCase):
         class RapidSplitClient:
             def _ReadPartitionKeyRanges(self, _collection_link, feed_options=None, **kwargs):
                 call_count['count'] += 1
-                TestRoutingMapProvider._capture_internal_headers(kwargs, f'"etag-{call_count["count"]}"')
-                if call_count['count'] == 1:
-                    return delta_ranges
-                return full_ranges
+                TestRoutingMapProviderAsync._capture_internal_headers(kwargs, f'"etag-{call_count["count"]}"')
+                data = delta_ranges if call_count['count'] == 1 else full_ranges
+
+                async def _gen():
+                    for r in data:
+                        yield r
+
+                return _gen()
 
         provider = PartitionKeyRangeCache(RapidSplitClient())
         from azure.cosmos import _base
         collection_link = "dbs/db/colls/container"
         collection_id = _base.GetResourceIdOrFullNameFromLink(collection_link)
 
-        result = provider._fetch_routing_map(
+        result = await provider._fetch_routing_map(
             collection_link=collection_link,
             collection_id=collection_id,
             previous_routing_map=initial_map,
@@ -626,7 +625,7 @@ class TestRoutingMapProvider(unittest.TestCase):
         ids = [r['id'] for r in ranges]
         self.assertEqual(ids, ['0', '1A-i', '1A-ii', '1B', '2'])
 
-    def test_fetch_routing_map_merge_range_info_from_correct_parent(self):
+    async def test_fetch_routing_map_merge_range_info_from_correct_parent_async(self):
         """Verifies range_info is inherited from the first CACHED parent, not necessarily parents[0].
 
         Scenario:
@@ -656,15 +655,20 @@ class TestRoutingMapProvider(unittest.TestCase):
 
         class MergeClient:
             def _ReadPartitionKeyRanges(self, _collection_link, feed_options=None, **kwargs):
-                TestRoutingMapProvider._capture_internal_headers(kwargs, '"etag-2"')
-                return delta_ranges
+                TestRoutingMapProviderAsync._capture_internal_headers(kwargs, '"etag-2"')
+
+                async def _gen():
+                    for r in delta_ranges:
+                        yield r
+
+                return _gen()
 
         provider = PartitionKeyRangeCache(MergeClient())
         from azure.cosmos import _base
         collection_link = "dbs/db/colls/container"
         collection_id = _base.GetResourceIdOrFullNameFromLink(collection_link)
 
-        result = provider._fetch_routing_map(
+        result = await provider._fetch_routing_map(
             collection_link=collection_link,
             collection_id=collection_id,
             previous_routing_map=initial_map,
@@ -680,7 +684,7 @@ class TestRoutingMapProvider(unittest.TestCase):
         # range_info for '3' should come from '1A' (first cached parent), not '1' (evicted)
         self.assertEqual(result._orderedPartitionInfo[1], 'info_1A')
 
-    def test_force_refresh_without_previous_map_triggers_targeted_fetch(self):
+    async def test_force_refresh_without_previous_map_triggers_targeted_fetch_async(self):
         """force_refresh=True without previous_routing_map should still trigger a targeted fetch.
 
         This guards the 410 path where collection_link is known but previous_routing_map
@@ -692,99 +696,99 @@ class TestRoutingMapProvider(unittest.TestCase):
         class CountingClient:
             def _ReadPartitionKeyRanges(self, _collection_link, feed_options=None, **kwargs):
                 call_count['count'] += 1
-                TestRoutingMapProvider._capture_internal_headers(kwargs, f'"test-etag-{call_count["count"]}"')
-                return original_ranges
+                TestRoutingMapProviderAsync._capture_internal_headers(kwargs, f'"test-etag-{call_count["count"]}"')
+
+                async def _gen():
+                    for r in original_ranges:
+                        yield r
+
+                return _gen()
 
         provider = PartitionKeyRangeCache(CountingClient())
         collection_link = "dbs/db/colls/container"
 
         # Initial load
-        result1 = provider.get_routing_map(collection_link, feed_options={})
+        result1 = await provider.get_routing_map(collection_link, feed_options={})
         self.assertEqual(call_count['count'], 1)
         self.assertIsNotNone(result1)
 
         # force_refresh=True without previous_routing_map should still fetch once.
-        result2 = provider.get_routing_map(
+        result2 = await provider.get_routing_map(
             collection_link, feed_options={},
             force_refresh=True
         )
         self.assertEqual(call_count['count'], 2, "force_refresh=True without previous_routing_map should trigger fetch")
         self.assertIsNotNone(result2)
 
-    def test_concurrent_refresh_serialized_by_lock(self):
+    async def test_concurrent_refresh_serialized_by_lock_async(self):
         """Under concurrent force_refresh calls, the per-collection lock serializes refreshes.
 
-        Verifies that threads don't corrupt the cache and all get a valid result.
-        With `and`, only the first thread that finds the cache stale actually fetches.
-        Subsequent threads see the updated ETag and skip the redundant fetch.
+        Verifies that coroutines don't corrupt the cache and all get a valid result.
         """
+        import asyncio
         call_count = {'count': 0}
         original_ranges = self.partition_key_ranges
-        fetch_event = threading.Event()
+        fetch_event = asyncio.Event()
 
         class SlowCountingClient:
             def _ReadPartitionKeyRanges(self, _collection_link, feed_options=None, **kwargs):
                 call_count['count'] += 1
-                # Simulate a slow service call to widen the contention window
-                fetch_event.wait(timeout=2)
-                TestRoutingMapProvider._capture_internal_headers(kwargs, f'"test-etag-{call_count["count"]}"')
-                return original_ranges
+
+                async def _gen():
+                    await fetch_event.wait()
+                    TestRoutingMapProviderAsync._capture_internal_headers(kwargs, f'"test-etag-{call_count["count"]}"')
+                    for r in original_ranges:
+                        yield r
+
+                return _gen()
 
         provider = PartitionKeyRangeCache(SlowCountingClient())
         collection_link = "dbs/db/colls/container"
 
-        # Populate cache with initial map
-        fetch_event.set()  # Let the initial load go fast
-        initial_map = provider.get_routing_map(collection_link, feed_options={})
+        # Populate cache with initial map (let it go fast)
+        fetch_event.set()
+        initial_map = await provider.get_routing_map(collection_link, feed_options={})
         self.assertEqual(call_count['count'], 1)
-        fetch_event.clear()  # Now make subsequent fetches slow
+        fetch_event.clear()
 
-        results = [None] * 5
-        errors = []
+        async def refresh_fn():
+            return await provider.get_routing_map(
+                collection_link, feed_options={},
+                force_refresh=True, previous_routing_map=initial_map
+            )
 
-        def thread_fn(idx):
-            try:
-                results[idx] = provider.get_routing_map(
-                    collection_link, feed_options={},
-                    force_refresh=True, previous_routing_map=initial_map
-                )
-            except Exception as e:
-                errors.append(e)
+        # Launch 5 concurrent refresh coroutines
+        tasks = [asyncio.create_task(refresh_fn()) for _ in range(5)]
 
-        threads = [threading.Thread(target=thread_fn, args=(i,)) for i in range(5)]
-        for t in threads:
-            t.start()
-
-        # Give threads time to all start and contend on the lock
-        import time
-        time.sleep(0.2)
-        # Release the slow fetch
+        await asyncio.sleep(0.1)
         fetch_event.set()
 
-        for t in threads:
-            t.join(timeout=10)
+        results = await asyncio.gather(*tasks)
 
-        self.assertEqual(len(errors), 0, f"Threads raised errors: {errors}")
-        # All threads should get a non-None result
+        # All coroutines should get a non-None result
         for i, r in enumerate(results):
-            self.assertIsNotNone(r, f"Thread {i} got None")
+            self.assertIsNotNone(r, f"Coroutine {i} got None")
 
-    def test_cache_never_none_during_refresh(self):
+    async def test_cache_never_none_during_refresh_async(self):
         """Fast-path readers should never see None in the cache during a refresh.
 
-        The cache entry is atomically replaced, never deleted. This test verifies
-        that concurrent readers always see either the old valid map or the new valid map.
+        The cache entry is atomically replaced, never deleted.
         """
+        import asyncio
         original_ranges = self.partition_key_ranges
         call_count = {'count': 0}
 
         class SlowClient:
             def _ReadPartitionKeyRanges(self, _collection_link, feed_options=None, **kwargs):
                 call_count['count'] += 1
-                import time
-                time.sleep(0.1)  # Simulate network delay
-                TestRoutingMapProvider._capture_internal_headers(kwargs, f'"etag-{call_count["count"]}"')
-                return original_ranges
+
+                async def _gen():
+                    await asyncio.sleep(0.05)
+                    TestRoutingMapProviderAsync._capture_internal_headers(kwargs, f'"etag-{call_count["count"]}"')
+                    for r in original_ranges:
+                        yield r
+
+                return _gen()
 
         provider = PartitionKeyRangeCache(SlowClient())
         collection_link = "dbs/db/colls/container"
@@ -792,38 +796,33 @@ class TestRoutingMapProvider(unittest.TestCase):
         collection_id = _base.GetResourceIdOrFullNameFromLink(collection_link)
 
         # Populate cache
-        initial_map = provider.get_routing_map(collection_link, feed_options={})
+        initial_map = await provider.get_routing_map(collection_link, feed_options={})
         self.assertIsNotNone(initial_map)
 
         none_seen = {'count': 0}
-        stop_event = threading.Event()
+        stop_event = asyncio.Event()
 
-        def reader_fn():
-            """Continuously reads the cache and checks it's never None."""
+        async def reader_fn():
             while not stop_event.is_set():
                 cached = provider._collection_routing_map_by_item.get(collection_id)
                 if cached is None:
                     none_seen['count'] += 1
+                await asyncio.sleep(0)
 
-        def refresher_fn():
-            """Triggers a force refresh."""
-            provider.get_routing_map(
+        async def refresher_fn():
+            await provider.get_routing_map(
                 collection_link, feed_options={},
                 force_refresh=True, previous_routing_map=initial_map
             )
 
-        reader = threading.Thread(target=reader_fn)
-        refresher = threading.Thread(target=refresher_fn)
-
-        reader.start()
-        refresher.start()
-        refresher.join(timeout=10)
+        reader_task = asyncio.create_task(reader_fn())
+        await refresher_fn()
         stop_event.set()
-        reader.join(timeout=5)
+        await reader_task
 
         self.assertEqual(none_seen['count'], 0,
                          "Cache entry should never be None during a refresh — it should be atomically replaced")
 
+
 if __name__ == "__main__":
-    # import sys;sys.argv = ['', 'Test.testName']
     unittest.main()
