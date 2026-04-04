@@ -7,6 +7,7 @@
         "caplog",
         "genai",
         "hypercorn",
+        "invocations",
         "openapi",
         "paramtype",
         "pytestmark",
